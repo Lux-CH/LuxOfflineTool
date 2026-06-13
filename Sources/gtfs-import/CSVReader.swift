@@ -1,22 +1,9 @@
-//
-//  CSVReader.swift
-//  Lux
-//
-//  Minimal streaming RFC-4180 CSV reader for GTFS files. Reads the file in
-//  chunks (never loads the whole thing into memory — `stop_times.txt` is multiple
-//  GB) and yields one record at a time. Handles quoted fields, escaped quotes
-//  ("") and embedded commas/newlines.
-//
-
 import Foundation
 
 enum CSVReaderError: Error { case cannotOpen }
 
 struct CSVReader {
 
-    /// Parse `url`, invoking `onRecord` for each row (including the header).
-    /// Return `false` from `onRecord` to stop early. `onProgress` reports the
-    /// fraction of the file consumed (0...1), throttled by the caller's needs.
     static func parse(
         url: URL,
         onProgress: ((Double) -> Void)? = nil,
@@ -37,7 +24,7 @@ struct CSVReader {
         var sawAnyByteInRecord = false
 
         let comma: UInt8 = 0x2C, quote: UInt8 = 0x22, cr: UInt8 = 0x0D, lf: UInt8 = 0x0A
-        let chunkSize = 1 << 20  // 1 MB
+        let chunkSize = 1 << 20
 
         func flushField() {
             record.append(String(decoding: field, as: UTF8.self))
@@ -46,8 +33,6 @@ struct CSVReader {
 
         var stop = false
         while !stop {
-            // autoreleasepool bounds the transient allocations from readData and
-            // per-row String building over the multi-GB stop_times file.
             try autoreleasepool {
                 let data = handle.readData(ofLength: chunkSize)
                 if data.isEmpty { stop = true; return }
@@ -65,7 +50,7 @@ struct CSVReader {
                     }
                     if quoteJustClosed {
                         quoteJustClosed = false
-                        if byte == quote { field.append(quote); inQuotes = true; continue } // escaped ""
+                        if byte == quote { field.append(quote); inQuotes = true; continue }
                     }
                     switch byte {
                     case quote:
@@ -91,7 +76,6 @@ struct CSVReader {
             }
         }
 
-        // Trailing record with no final newline.
         if !field.isEmpty || !record.isEmpty {
             flushField()
             _ = try onRecord(record)
@@ -100,13 +84,11 @@ struct CSVReader {
     }
 }
 
-/// Maps a GTFS header row to column indices for tolerant, order-independent access.
 struct CSVColumns {
     private let index: [String: Int]
     init(header: [String]) {
         var map = [String: Int]()
         for (i, name) in header.enumerated() {
-            // Strip BOM and whitespace from the first/each header cell.
             let clean = name.replacingOccurrences(of: "\u{FEFF}", with: "")
                 .trimmingCharacters(in: .whitespaces)
             map[clean] = i

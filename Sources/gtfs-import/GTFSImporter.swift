@@ -1,35 +1,8 @@
-//
-//  GTFSImporter.swift
-//  Lux
-//
-//  Imports an extracted GTFS feed into `OfflineGTFSStore`, keeping only the
-//  region defined by `OfflineRegion`. Trips that merely pass through the box are
-//  kept whole (all their stops), so trip detail views stay complete even when a
-//  trip continues outside the box.
-//
-//  Pipeline (streaming, bounded memory):
-//   1. stops.txt → insert ALL stops straight into SQLite (batched); keep only a
-//      hashed set of in-region stop ids in memory
-//   2. stop_times pass 1 → hashed set of trip ids that touch the region
-//   3. trips.txt → kept trips, collecting route + service ids
-//   4. routes.txt / calendar.txt / calendar_dates.txt → kept rows
-//   5. stop_times pass 2 → insert kept stop_times
-//
-//  Memory notes: stops live in the DB, not the heap, so there is no in-memory
-//  stop dictionary. The two large in-memory sets (in-region stop ids, kept trip
-//  ids) hold 64-bit FNV-1a *hashes* rather than the (long) id strings — they are
-//  used for membership tests only, and the 64-bit collision probability over a
-//  national feed (~10⁻⁸) is negligible. This keeps peak RAM to a few MB even on
-//  the multi-GB stop_times pass.
-//
-
 import Foundation
 import GRDB
 
 enum GTFSImportError: Error { case missingFile(String) }
 
-/// FNV-1a 64-bit hash of a string's UTF-8 bytes. Stable within a run; used to
-/// hold id membership sets compactly (no string storage) during import.
 @inline(__always)
 func gtfsHash(_ s: String) -> UInt64 {
     var h: UInt64 = 0xcbf2_9ce4_8422_2325
@@ -39,11 +12,8 @@ func gtfsHash(_ s: String) -> UInt64 {
 
 struct GTFSImporter {
 
-    /// Rows per insert transaction. Bounds the transient array of boxed values.
     private static let batchSize = 20_000
 
-    /// Run the import. `progress` receives 0...1 for the import stage only.
-    /// `extractedDir` is the directory containing the GTFS .txt files.
     static func run(extractedDir: URL, into store: OfflineGTFSStore,
                     progress: @escaping (Double) -> Void) throws {
         let stopsURL = try locate("stops.txt", in: extractedDir)
@@ -51,9 +21,6 @@ struct GTFSImporter {
         let tripsURL = try locate("trips.txt", in: extractedDir)
         let routesURL = try locate("routes.txt", in: extractedDir)
 
-        // --- Phase 1: stops.txt → insert ALL stops, collect in-region hashes -
-        // Stops live in the DB (small table); we only keep a hashed membership
-        // set of the in-region ids for Phase 2's filter.
         var inRegion = Set<UInt64>()
         var stopBatch = [[DatabaseValueConvertible?]]()
         stopBatch.reserveCapacity(batchSize)
@@ -86,7 +53,6 @@ struct GTFSImporter {
         try flushStops()
         progress(0.05)
 
-        // --- Phase 2: stop_times pass 1 → kept trip ids (hashed) -------------
         var keptTrips = Set<UInt64>()
         try forEachRow(stopTimesURL, progress: { progress(0.05 + 0.40 * $0) }) { cols, row in
             guard let stopId = cols.value(row, "stop_id"), inRegion.contains(gtfsHash(stopId)),
@@ -96,7 +62,6 @@ struct GTFSImporter {
         inRegion.removeAll()
         progress(0.45)
 
-        // --- Phase 3: trips.txt → kept trips, collect routes + services ------
         var keptRoutes = Set<String>()
         var keptServices = Set<String>()
         try store.dbQueue.write { db in
@@ -111,7 +76,6 @@ struct GTFSImporter {
             }
         }
 
-        // --- Phase 4: routes.txt --------------------------------------------
         try store.dbQueue.write { db in
             let stmt = try db.makeStatement(sql:
                 "INSERT OR REPLACE INTO route (id, short_name, route_type, agency_id, color) VALUES (?,?,?,?,?)")
@@ -127,13 +91,9 @@ struct GTFSImporter {
             }
         }
 
-        // --- Phase 4b: calendars --------------------------------------------
         try importCalendars(dir: extractedDir, keptServices: keptServices, store: store)
         progress(0.50)
 
-        // --- Phase 5: stop_times pass 2 → insert kept stop_times -------------
-        // All stops are already in the DB (Phase 1), so we don't track referenced
-        // stops here.
         var batch = [[DatabaseValueConvertible?]]()
         batch.reserveCapacity(batchSize)
         func flush() throws {
@@ -163,15 +123,12 @@ struct GTFSImporter {
         }
         try flush()
 
-        // --- Done: record import date ---------------------------------------
         try store.dbQueue.write { db in
             try db.execute(sql: "INSERT OR REPLACE INTO meta (key, value) VALUES ('import_date', ?)",
                            arguments: [String(Date().timeIntervalSince1970)])
         }
         progress(1.0)
     }
-
-    // MARK: - Calendars
 
     private static func importCalendars(dir: URL, keptServices: Set<String>, store: OfflineGTFSStore) throws {
         if let calURL = try? locate("calendar.txt", in: dir) {
@@ -207,9 +164,6 @@ struct GTFSImporter {
         }
     }
 
-    // MARK: - Row iteration
-
-    /// Reads a GTFS CSV, parsing the header then calling `body(columns, row)` per data row.
     private static func forEachRow(_ url: URL, progress: ((Double) -> Void)? = nil,
                                    _ body: (CSVColumns, [String]) throws -> Void) throws {
         var columns: CSVColumns?
@@ -223,7 +177,6 @@ struct GTFSImporter {
     private static func locate(_ name: String, in dir: URL) throws -> URL {
         let direct = dir.appendingPathComponent(name)
         if FileManager.default.fileExists(atPath: direct.path) { return direct }
-        // Some feeds nest files in a subfolder — search one level deep.
         if let items = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
             for item in items where item.hasDirectoryPath {
                 let nested = item.appendingPathComponent(name)
@@ -234,7 +187,6 @@ struct GTFSImporter {
     }
 }
 
-/// "HH:MM:SS" → seconds past service midnight (handles values ≥ 24:00:00). nil if empty/invalid.
 func gtfsSeconds(_ value: String?) -> Int? {
     guard let value, !value.isEmpty else { return nil }
     let parts = value.split(separator: ":")
